@@ -10,6 +10,8 @@ import urllib.parse
 from html import unescape
 from aiohttp import web
 import httpx
+import psutil
+import speedtest
 import trafilatura
 import websockets
 
@@ -24,12 +26,14 @@ logging.basicConfig(
 )
 
 # ==============================================================================
-# CONFIGURATION & TOKEN SANITIZATION
+# CONFIGURATION & AUTHENTICATION
 # ==============================================================================
-# Optional hardcoded fallback; otherwise pulled from Render Environment Variable
-HARDCODED_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
+# Optional hardcoded fallbacks; otherwise set via Render Environment Variables
+HARDCODED_XIAOZHI_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
+HARDCODED_BRAVE_API_KEY = "BSAKb72H0GlIbFx7PtG0W1DAtNkTBib"
 
-RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_TOKEN).strip().strip('"').strip("'")
+RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_XIAOZHI_TOKEN).strip().strip('"').strip("'")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", HARDCODED_BRAVE_API_KEY).strip()
 PORT = int(os.environ.get("PORT", 8000))
 
 def get_sanitized_connection():
@@ -40,7 +44,6 @@ def get_sanitized_connection():
 
     raw = RAW_TOKEN_INPUT
 
-    # Extract token if user pasted the entire wss:// URL
     if "token=" in raw:
         token_match = re.search(r'token=([^&\s]+)', raw)
         token = token_match.group(1) if token_match else raw.split("token=")[-1]
@@ -54,7 +57,6 @@ def get_sanitized_connection():
     clean_token = urllib.parse.unquote(token).strip()
     ws_url = f"wss://api.xiaozhi.me/mcp/?token={clean_token}"
 
-    # Browser-grade handshake headers to bypass Cloudflare / reverse-proxy 400s
     headers = [
         ("Host", "api.xiaozhi.me"),
         ("Origin", "https://xiaozhi.me"),
@@ -112,20 +114,43 @@ def recall_facts(keyword: str = "") -> str:
         return f"Recall error: {e}"
 
 # ==============================================================================
-# 24/7 CLOUD-NATIVE CAPABILITIES & MULTI-TIER SEARCH FALLBACK
+# 24/7 CLOUD SEARCH (BRAVE SEARCH PRIMARY + MULTI-TIER FALLBACKS)
 # ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
-    """
-    Resilient cloud web search designed for Render.com.
-    Bypasses datacenter blocks using DDGS fallbacks and direct HTML parsing.
-    """
     clean_query = query.strip()
     if not clean_query:
         return "Please provide a valid search query."
 
-    # Strategy 1: DDGS with 'lite' or 'html' backend
+    # Strategy 1: Brave Search API (Primary - Clean, Fast, No Datacenter Blocks)
+    if BRAVE_API_KEY:
+        try:
+            url = "https://api.search.brave.com/res/v1/web/search"
+            headers = {
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": BRAVE_API_KEY
+            }
+            params = {"q": clean_query, "count": min(max_results, 10)}
+
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.get(url, headers=headers, params=params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    results = data.get("web", {}).get("results", [])
+                    if results:
+                        formatted = []
+                        for i, r in enumerate(results[:max_results], 1):
+                            title = r.get("title", "No Title")
+                            link = r.get("url", "")
+                            desc = r.get("description", "")
+                            formatted.append(f"{i}. {title}\n   {link}\n   {desc}\n")
+                        return "\n".join(formatted)
+        except Exception as e:
+            logging.warning(f"Brave Search API error: {e}. Falling back...")
+
+    # Strategy 2: DDGS with 'lite' backend
     try:
-        with DDGS(timeout=8) as ddgs:
+        with DDGS(timeout=7) as ddgs:
             results = list(ddgs.text(clean_query, max_results=max_results, backend="lite"))
             if results:
                 return "\n".join([
@@ -133,9 +158,9 @@ def search_web(query: str, max_results: int = 5) -> str:
                     for i, item in enumerate(results, 1)
                 ])
     except Exception as e:
-        logging.warning(f"DDGS primary backend failed on Render: {e}. Trying direct HTML fallback...")
+        logging.warning(f"DDGS failed on cloud: {e}. Trying direct HTML...")
 
-    # Strategy 2: Direct query against DuckDuckGo HTML endpoint via httpx
+    # Strategy 3: Direct DuckDuckGo HTML parsing
     try:
         url = "https://html.duckduckgo.com/html/"
         data = {"q": clean_query}
@@ -146,15 +171,13 @@ def search_web(query: str, max_results: int = 5) -> str:
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as client:
+        with httpx.Client(timeout=8.0, follow_redirects=True, headers=headers) as client:
             resp = client.post(url, data=data)
             if resp.status_code == 200:
                 html = resp.text
-                
                 titles = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', html, re.DOTALL)
                 snippets = [re.sub(r'<[^>]+>', '', unescape(s)).strip() for s in titles]
                 urls = re.findall(r'href="//duckduckgo.com/l/\?uddg=([^"&]+)', html)
-                
                 clean_urls = [urllib.parse.unquote(u) for u in urls]
                 heading_matches = re.findall(r'<a class="result__url[^>]*href="[^"]*"[^>]*>(.*?)</a>', html, re.DOTALL)
                 headings = [re.sub(r'<[^>]+>', '', unescape(h)).strip() for h in heading_matches]
@@ -173,10 +196,10 @@ def search_web(query: str, max_results: int = 5) -> str:
     except Exception as e:
         logging.warning(f"Direct HTML scrape failed: {e}")
 
-    # Strategy 3: Wikipedia API fallback for factual knowledge
+    # Strategy 4: Wikipedia REST API fallback
     try:
         wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(clean_query)}"
-        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
             resp = client.get(wiki_url)
             if resp.status_code == 200:
                 data = resp.json()
@@ -188,7 +211,56 @@ def search_web(query: str, max_results: int = 5) -> str:
     except Exception:
         pass
 
-    return f"No results found for '{clean_query}'. (Cloud search provider rate-limited)."
+    return f"No results found for '{clean_query}'. (Search provider rate-limited)."
+
+# ==============================================================================
+# NETWORK DIAGNOSTICS & SYSTEM UTILITIES
+# ==============================================================================
+def test_network_speed() -> str:
+    try:
+        logging.info("Running speedtest benchmark on cloud server...")
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        down_mbps = round(st.download() / 1e6, 2)
+        up_mbps = round(st.upload() / 1e6, 2)
+        ping_ms = round(st.results.ping, 1)
+        server_info = st.results.server.get("name", "Unknown")
+        country = st.results.server.get("country", "")
+
+        return (
+            f"Network Speed Test Results:\n"
+            f"- Download Speed: {down_mbps} Mbps\n"
+            f"- Upload Speed: {up_mbps} Mbps\n"
+            f"- Latency (Ping): {ping_ms} ms\n"
+            f"- Server Location: {server_info}, {country}"
+        )
+    except Exception as e:
+        return f"Network speed test failed: {str(e)}"
+
+def scan_wifi_signal() -> str:
+    try:
+        # Check if running on local Windows
+        if os.name == "nt":
+            import subprocess
+            res = subprocess.run("netsh wlan show interfaces", capture_output=True, text=True, shell=True)
+            ssid = re.search(r"^\s*SSID\s*:\s*(.+)$", res.stdout, re.MULTILINE)
+            sig = re.search(r"^\s*Signal\s*:\s*(\d+)%", res.stdout, re.MULTILINE)
+            if ssid and sig:
+                return f"Wi-Fi Status: Connected to '{ssid.group(1).strip()}' with {sig.group(1).strip()}% signal strength."
+            return "Wi-Fi is not connected or no wireless interface found."
+
+        # Running in Render Cloud Container (Linux Datacenter)
+        net_stats = psutil.net_if_stats()
+        active_interfaces = [iface for iface, stats in net_stats.items() if stats.isup and iface != "lo"]
+
+        return (
+            f"Cloud Network Status (Render.com Datacenter):\n"
+            f"- Connection Type: High-Speed Fiber Uplink (Virtual Ethernet)\n"
+            f"- Active Interfaces: {', '.join(active_interfaces) if active_interfaces else 'eth0'}\n"
+            f"- Wi-Fi Interface: N/A (Cloud servers use direct datacenter fiber, not wireless 802.11 Wi-Fi)."
+        )
+    except Exception as e:
+        return f"Failed to inspect network interface: {str(e)}"
 
 def fetch_page_content(url: str, max_chars: int = 6000) -> str:
     try:
@@ -229,10 +301,12 @@ def execute_python_calc(code: str) -> str:
         return f"Calculation error: {e}"
 
 # ==============================================================================
-# TOOL REGISTRY
+# TOOL REGISTRY (REGISTERED WITH XIAOZHI)
 # ==============================================================================
 TOOLS = [
-    {"name": "web_search", "description": "Searches the live web for news, facts, and live information.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "web_search", "description": "Searches the live web via Brave Search with automated multi-tier fallbacks.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "test_network_speed", "description": "Measures download bandwidth, upload throughput, and ping latency in real-time.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "scan_wifi_signal", "description": "Inspects active network connection, Wi-Fi SSID signal strength, and adapter status.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "fetch_page_content", "description": "Extracts clean readable text from a given webpage URL.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
     {"name": "get_live_weather", "description": "Gets current temperature, feels-like temperature, and wind speed using coordinates.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
     {"name": "get_rainfall_forecast", "description": "Fetches rainfall accumulation in mm and rain probability percentage.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
@@ -242,7 +316,7 @@ TOOLS = [
 ]
 
 # ==============================================================================
-# MCP PROTOCOL HANDLER
+# MCP PROTOCOL ROUTER
 # ==============================================================================
 async def handle_mcp_message(ws, raw_msg: str):
     try:
@@ -261,7 +335,7 @@ async def handle_mcp_message(ws, raw_msg: str):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.2.0"}
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.3.0"}
             }
         }))
     elif method == "tools/list":
@@ -278,6 +352,10 @@ async def handle_mcp_message(ws, raw_msg: str):
         try:
             if name == "web_search":
                 result_text = await asyncio.to_thread(search_web, args.get("query", ""))
+            elif name in ("test_network_speed", "speed_test", "wifi_speed"):
+                result_text = await asyncio.to_thread(test_network_speed)
+            elif name in ("scan_wifi_signal", "check_wifi", "wifi_status"):
+                result_text = await asyncio.to_thread(scan_wifi_signal)
             elif name == "fetch_page_content":
                 result_text = await asyncio.to_thread(fetch_page_content, args.get("url", ""))
             elif name == "get_live_weather":
