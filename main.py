@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import urllib.parse
 from aiohttp import web
@@ -19,18 +20,35 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 BASE_ENDPOINT = "wss://api.xiaozhi.me/mcp/"
-XIAOZHI_TOKEN = os.environ.get("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q", "")
+XIAOZHI_TOKEN = os.environ.get("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q", "").strip().strip('"').strip("'")
 PORT = int(os.environ.get("PORT", 8000))
 
-def get_connection_url() -> str:
-    token_str = XIAOZHI_TOKEN.strip()
-    if token_str.startswith("wss://") or token_str.startswith("ws://"):
-        return token_str
-    separator = "&" if "?" in BASE_ENDPOINT else "?"
-    return f"{BASE_ENDPOINT}{separator}token={token_str}"
+# ==============================================================================
+# TOKEN & HEADERS (Solves HTTP 400 Bad Request)
+# ==============================================================================
+def get_connection_config():
+    raw_token = XIAOZHI_TOKEN
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    if raw_token.startswith("wss://") or raw_token.startswith("ws://"):
+        parsed = urllib.parse.urlparse(raw_token)
+        query_params = urllib.parse.parse_qs(parsed.query)
+        extracted_token = query_params.get("token", [raw_token])[0]
+        url = raw_token
+        clean_token = extracted_token
+    else:
+        clean_token = raw_token
+        separator = "&" if "?" in BASE_ENDPOINT else "?"
+        url = f"{BASE_ENDPOINT}{separator}token={urllib.parse.quote(clean_token)}"
 
+    headers = [
+        ("Authorization", f"Bearer {clean_token}"),
+        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    ]
+    return url, headers
+
+# ==============================================================================
+# CLOUD SQLITE MEMORY
+# ==============================================================================
 DB_PATH = "xiaozhi_cloud_memory.db"
 
 def init_db():
@@ -77,6 +95,9 @@ def recall_facts(keyword: str = "") -> str:
     except Exception as e:
         return f"Recall error: {e}"
 
+# ==============================================================================
+# CLOUD TOOLS
+# ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
     try:
         with DDGS() as ddgs:
@@ -89,7 +110,8 @@ def search_web(query: str, max_results: int = 5) -> str:
 
 def fetch_page_content(url: str, max_chars: int = 6000) -> str:
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True, headers=HEADERS) as client:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
             resp = client.get(url)
             text = trafilatura.extract(resp.text, include_links=False, output_format="txt")
             return text[:max_chars] if text else "Failed to extract text."
@@ -134,6 +156,9 @@ TOOLS = [
     {"name": "execute_python_calc", "description": "Evaluates Python math expressions.", "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}
 ]
 
+# ==============================================================================
+# WEBSOCKET PROTOCOL & CONNECTION
+# ==============================================================================
 async def handle_mcp_message(ws, raw_msg: str):
     try:
         data = json.loads(raw_msg)
@@ -143,7 +168,7 @@ async def handle_mcp_message(ws, raw_msg: str):
     msg_id, method, params = data.get("id"), data.get("method"), data.get("params", {})
 
     if method == "initialize":
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "xiaozhi-koyeb-cloud", "version": "1.0.0"}}}))
+        await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.0.0"}}}))
     elif method == "tools/list":
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}))
     elif method == "tools/call":
@@ -176,26 +201,32 @@ async def handle_mcp_message(ws, raw_msg: str):
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {}}))
 
 async def run_mcp_bridge():
-    ws_url = get_connection_url()
+    ws_url, headers = get_connection_config()
+    masked_url = re.sub(r"token=([^&]{4})[^&]+", r"token=\1****", ws_url)
+    logging.info(f"Target WebSocket Endpoint: {masked_url}")
 
     while True:
         try:
-            logging.info("Connecting to XiaoZhi Gateway from Koyeb...")
-            async with websockets.connect(
-                ws_url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=10
-            ) as ws:
-                logging.info("XiaoZhi Cloud Bridge connected on Koyeb.")
+            logging.info("Connecting to XiaoZhi Gateway from Render...")
+            connect_kwargs = {"ping_interval": 20, "ping_timeout": 20, "close_timeout": 10}
+            try:
+                ws_connect = websockets.connect(ws_url, additional_headers=headers, **connect_kwargs)
+            except TypeError:
+                ws_connect = websockets.connect(ws_url, extra_headers=headers, **connect_kwargs)
+
+            async with ws_connect as ws:
+                logging.info("XiaoZhi Cloud Bridge connected successfully on Render!")
                 async for msg in ws:
                     await handle_mcp_message(ws, msg)
         except Exception as e:
             logging.warning(f"Bridge disconnected ({e}). Reconnecting in 5s...")
             await asyncio.sleep(5)
 
+# ==============================================================================
+# RENDER HTTP HEALTH CHECK
+# ==============================================================================
 async def health_check(request):
-    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7!")
+    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 on Render!")
 
 async def start_background_tasks(app):
     app['mcp_task'] = asyncio.create_task(run_mcp_bridge())
