@@ -17,37 +17,53 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-BASE_ENDPOINT = "wss://api.xiaozhi.me/mcp/"
-XIAOZHI_TOKEN = os.environ.get("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q", "").strip().strip('"').strip("'")
+# ==============================================================================
+# CONFIGURATION & TOKEN SANITIZATION
+# ==============================================================================
+# You can paste your raw token here as a fallback, OR set it in Render's Environment
+HARDCODED_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"  # e.g., "eyJhbGciOi..." or leave blank to use Environment variable
+
+RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_TOKEN).strip().strip('"').strip("'")
 PORT = int(os.environ.get("PORT", 8000))
 
-# ==============================================================================
-# TOKEN & HEADERS (Solves HTTP 400 Bad Request)
-# ==============================================================================
-def get_connection_config():
-    raw_token = XIAOZHI_TOKEN
+def get_sanitized_connection():
+    """Extracts raw token cleanly and formats the canonical WSS endpoint."""
+    if not RAW_TOKEN_INPUT:
+        logging.error("CRITICAL: No XIAOZHI_TOKEN provided in code or environment!")
+        return "wss://api.xiaozhi.me/mcp/", []
 
-    if raw_token.startswith("wss://") or raw_token.startswith("ws://"):
-        parsed = urllib.parse.urlparse(raw_token)
-        query_params = urllib.parse.parse_qs(parsed.query)
-        extracted_token = query_params.get("token", [raw_token])[0]
-        url = raw_token
-        clean_token = extracted_token
+    raw = RAW_TOKEN_INPUT
+
+    # Extract token if user pasted the entire wss:// URL
+    if "token=" in raw:
+        # Pull everything after 'token=' up to any '&' or trailing space
+        token_match = re.search(r'token=([^&\s]+)', raw)
+        token = token_match.group(1) if token_match else raw.split("token=")[-1]
+    elif raw.startswith("wss://") or raw.startswith("ws://"):
+        parsed = urllib.parse.urlparse(raw)
+        query_dict = urllib.parse.parse_qs(parsed.query)
+        token = query_dict.get("token", [raw])[0]
     else:
-        clean_token = raw_token
-        separator = "&" if "?" in BASE_ENDPOINT else "?"
-        url = f"{BASE_ENDPOINT}{separator}token={urllib.parse.quote(clean_token)}"
+        token = raw
 
+    clean_token = urllib.parse.unquote(token).strip()
+    ws_url = f"wss://api.xiaozhi.me/mcp/?token={clean_token}"
+
+    # Browser-grade handshake headers to bypass Cloudflare / reverse-proxy 400s
     headers = [
-        ("Authorization", f"Bearer {clean_token}"),
+        ("Host", "api.xiaozhi.me"),
+        ("Origin", "https://xiaozhi.me"),
         ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     ]
-    return url, headers
+    return ws_url, headers
 
 # ==============================================================================
-# CLOUD SQLITE MEMORY
+# CLOUD SQLITE PERSISTENCE
 # ==============================================================================
 DB_PATH = "xiaozhi_cloud_memory.db"
 
@@ -90,13 +106,13 @@ def recall_facts(keyword: str = "") -> str:
         rows = c.fetchall()
         conn.close()
         if not rows:
-            return "No matching memories found."
-        return "Cloud Memories:\n" + "\n".join([f"- [{r[0]}] {r[1]}" for r in rows])
+            return "No matching memories found in cloud database."
+        return "Retrieved Cloud Memories:\n" + "\n".join([f"- [{r[0]}] {r[1]}" for r in rows])
     except Exception as e:
         return f"Recall error: {e}"
 
 # ==============================================================================
-# CLOUD TOOLS
+# 24/7 CLOUD-NATIVE CAPABILITIES
 # ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
     try:
@@ -114,7 +130,7 @@ def fetch_page_content(url: str, max_chars: int = 6000) -> str:
         with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
             resp = client.get(url)
             text = trafilatura.extract(resp.text, include_links=False, output_format="txt")
-            return text[:max_chars] if text else "Failed to extract text."
+            return text[:max_chars] if text else "Failed to extract clean webpage content."
     except Exception as e:
         return f"Fetch error: {e}"
 
@@ -123,7 +139,7 @@ def get_live_weather(latitude: float, longitude: float) -> str:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,wind_speed_10m&timezone=auto"
         with httpx.Client(timeout=10.0) as client:
             data = client.get(url).json().get("current", {})
-        return f"Weather: {data.get('temperature_2m')}°C, Humidity: {data.get('relative_humidity_2m')}%, Wind: {data.get('wind_speed_10m')} km/h"
+        return f"Current Weather: {data.get('temperature_2m')}°C (Feels like {data.get('apparent_temperature')}°C), Humidity: {data.get('relative_humidity_2m')}%, Wind: {data.get('wind_speed_10m')} km/h"
     except Exception as e:
         return f"Weather error: {e}"
 
@@ -135,7 +151,7 @@ def get_rainfall_forecast(latitude: float, longitude: float) -> str:
         daily = data.get("daily", {})
         today_sum = daily.get("precipitation_sum", [0])[0]
         today_prob = daily.get("precipitation_probability_max", [0])[0]
-        return f"Rainfall Forecast: {today_sum} mm expected today, peak chance: {today_prob}%."
+        return f"Rainfall Forecast: Expected precipitation today: {today_sum} mm. Peak probability: {today_prob}%."
     except Exception as e:
         return f"Rainfall error: {e}"
 
@@ -146,18 +162,21 @@ def execute_python_calc(code: str) -> str:
     except Exception as e:
         return f"Calculation error: {e}"
 
+# ==============================================================================
+# TOOL REGISTRY
+# ==============================================================================
 TOOLS = [
-    {"name": "web_search", "description": "Searches the live web.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-    {"name": "fetch_page_content", "description": "Extracts clean text from a webpage URL.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-    {"name": "get_live_weather", "description": "Gets current weather conditions.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
-    {"name": "get_rainfall_forecast", "description": "Fetches precipitation sum and rain probabilities.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
-    {"name": "remember_fact", "description": "Stores user facts in persistent cloud memory.", "inputSchema": {"type": "object", "properties": {"fact": {"type": "string"}, "category": {"type": "string"}}, "required": ["fact"]}},
-    {"name": "recall_facts", "description": "Retrieves facts from persistent cloud memory.", "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}}},
-    {"name": "execute_python_calc", "description": "Evaluates Python math expressions.", "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}
+    {"name": "web_search", "description": "Searches the live web for news, facts, and live information.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "fetch_page_content", "description": "Extracts clean readable text from a given webpage URL.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
+    {"name": "get_live_weather", "description": "Gets current temperature, feels-like temperature, and wind speed using coordinates.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
+    {"name": "get_rainfall_forecast", "description": "Fetches rainfall accumulation in mm and rain probability percentage.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
+    {"name": "remember_fact", "description": "Stores permanent facts and notes in the cloud SQLite database.", "inputSchema": {"type": "object", "properties": {"fact": {"type": "string"}, "category": {"type": "string"}}, "required": ["fact"]}},
+    {"name": "recall_facts", "description": "Retrieves stored facts and user notes from the cloud database.", "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}}},
+    {"name": "execute_python_calc", "description": "Performs exact Python math and arithmetic evaluation.", "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}
 ]
 
 # ==============================================================================
-# WEBSOCKET PROTOCOL & CONNECTION
+# MCP PROTOCOL HANDLER
 # ==============================================================================
 async def handle_mcp_message(ws, raw_msg: str):
     try:
@@ -165,12 +184,26 @@ async def handle_mcp_message(ws, raw_msg: str):
     except json.JSONDecodeError:
         return
 
-    msg_id, method, params = data.get("id"), data.get("method"), data.get("params", {})
+    msg_id = data.get("id")
+    method = data.get("method")
+    params = data.get("params", {})
 
     if method == "initialize":
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.0.0"}}}))
+        await ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.1.0"}
+            }
+        }))
     elif method == "tools/list":
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}))
+        await ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"tools": TOOLS}
+        }))
     elif method == "tools/call":
         name = params.get("name")
         args = params.get("arguments", {})
@@ -192,23 +225,35 @@ async def handle_mcp_message(ws, raw_msg: str):
             elif name == "execute_python_calc":
                 result_text = execute_python_calc(args.get("code", ""))
             else:
-                result_text, is_err = f"Tool '{name}' not found on cloud.", True
+                result_text, is_err = f"Tool '{name}' not found on cloud server.", True
         except Exception as e:
             result_text, is_err = str(e), True
 
-        await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": result_text}], "isError": is_err}}))
+        await ws.send(json.dumps({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "content": [{"type": "text", "text": result_text}],
+                "isError": is_err
+            }
+        }))
     elif method == "ping":
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {}}))
 
 async def run_mcp_bridge():
-    ws_url, headers = get_connection_config()
+    ws_url, headers = get_sanitized_connection()
     masked_url = re.sub(r"token=([^&]{4})[^&]+", r"token=\1****", ws_url)
-    logging.info(f"Target WebSocket Endpoint: {masked_url}")
+    logging.info(f"Target WebSocket: {masked_url}")
 
     while True:
         try:
-            logging.info("Connecting to XiaoZhi Gateway from Render...")
-            connect_kwargs = {"ping_interval": 20, "ping_timeout": 20, "close_timeout": 10}
+            logging.info("Initiating handshake with XiaoZhi...")
+            connect_kwargs = {
+                "ping_interval": 20,
+                "ping_timeout": 20,
+                "close_timeout": 10
+            }
+
             try:
                 ws_connect = websockets.connect(ws_url, additional_headers=headers, **connect_kwargs)
             except TypeError:
@@ -218,12 +263,16 @@ async def run_mcp_bridge():
                 logging.info("XiaoZhi Cloud Bridge connected successfully on Render!")
                 async for msg in ws:
                     await handle_mcp_message(ws, msg)
+
+        except (websockets.ConnectionClosed, ConnectionRefusedError) as e:
+            logging.warning(f"Connection dropped ({e}). Reconnecting in 5s...")
+            await asyncio.sleep(5)
         except Exception as e:
-            logging.warning(f"Bridge disconnected ({e}). Reconnecting in 5s...")
+            logging.error(f"Handshake error: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
 
 # ==============================================================================
-# RENDER HTTP HEALTH CHECK
+# AIOHTTP SERVER (PORT 8000)
 # ==============================================================================
 async def health_check(request):
     return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 on Render!")
