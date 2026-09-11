@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import urllib.parse
+from html import unescape
 from aiohttp import web
 import httpx
 import trafilatura
@@ -25,8 +26,8 @@ logging.basicConfig(
 # ==============================================================================
 # CONFIGURATION & TOKEN SANITIZATION
 # ==============================================================================
-# You can paste your raw token here as a fallback, OR set it in Render's Environment
-HARDCODED_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"  # e.g., "eyJhbGciOi..." or leave blank to use Environment variable
+# Optional hardcoded fallback; otherwise pulled from Render Environment Variable
+HARDCODED_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
 
 RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_TOKEN).strip().strip('"').strip("'")
 PORT = int(os.environ.get("PORT", 8000))
@@ -41,7 +42,6 @@ def get_sanitized_connection():
 
     # Extract token if user pasted the entire wss:// URL
     if "token=" in raw:
-        # Pull everything after 'token=' up to any '&' or trailing space
         token_match = re.search(r'token=([^&\s]+)', raw)
         token = token_match.group(1) if token_match else raw.split("token=")[-1]
     elif raw.startswith("wss://") or raw.startswith("ws://"):
@@ -58,7 +58,7 @@ def get_sanitized_connection():
     headers = [
         ("Host", "api.xiaozhi.me"),
         ("Origin", "https://xiaozhi.me"),
-        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
     ]
     return ws_url, headers
 
@@ -112,17 +112,83 @@ def recall_facts(keyword: str = "") -> str:
         return f"Recall error: {e}"
 
 # ==============================================================================
-# 24/7 CLOUD-NATIVE CAPABILITIES
+# 24/7 CLOUD-NATIVE CAPABILITIES & MULTI-TIER SEARCH FALLBACK
 # ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
+    """
+    Resilient cloud web search designed for Render.com.
+    Bypasses datacenter blocks using DDGS fallbacks and direct HTML parsing.
+    """
+    clean_query = query.strip()
+    if not clean_query:
+        return "Please provide a valid search query."
+
+    # Strategy 1: DDGS with 'lite' or 'html' backend
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        if not results:
-            return "No web results found."
-        return "\n".join([f"{i}. {item.get('title')}\n   {item.get('href')}\n   {item.get('body')}\n" for i, item in enumerate(results, 1)])
+        with DDGS(timeout=8) as ddgs:
+            results = list(ddgs.text(clean_query, max_results=max_results, backend="lite"))
+            if results:
+                return "\n".join([
+                    f"{i}. {item.get('title')}\n   {item.get('href')}\n   {item.get('body')}\n"
+                    for i, item in enumerate(results, 1)
+                ])
     except Exception as e:
-        return f"Search error: {e}"
+        logging.warning(f"DDGS primary backend failed on Render: {e}. Trying direct HTML fallback...")
+
+    # Strategy 2: Direct query against DuckDuckGo HTML endpoint via httpx
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        data = {"q": clean_query}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://html.duckduckgo.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        with httpx.Client(timeout=10.0, follow_redirects=True, headers=headers) as client:
+            resp = client.post(url, data=data)
+            if resp.status_code == 200:
+                html = resp.text
+                
+                titles = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', html, re.DOTALL)
+                snippets = [re.sub(r'<[^>]+>', '', unescape(s)).strip() for s in titles]
+                urls = re.findall(r'href="//duckduckgo.com/l/\?uddg=([^"&]+)', html)
+                
+                clean_urls = [urllib.parse.unquote(u) for u in urls]
+                heading_matches = re.findall(r'<a class="result__url[^>]*href="[^"]*"[^>]*>(.*?)</a>', html, re.DOTALL)
+                headings = [re.sub(r'<[^>]+>', '', unescape(h)).strip() for h in heading_matches]
+
+                items = []
+                count = min(len(snippets), max_results)
+                for i in range(count):
+                    link = clean_urls[i] if i < len(clean_urls) else "N/A"
+                    title = headings[i] if i < len(headings) else f"Result {i+1}"
+                    body = snippets[i]
+                    if body:
+                        items.append(f"{i+1}. {title}\n   {link}\n   {body}\n")
+
+                if items:
+                    return "\n".join(items)
+    except Exception as e:
+        logging.warning(f"Direct HTML scrape failed: {e}")
+
+    # Strategy 3: Wikipedia API fallback for factual knowledge
+    try:
+        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(clean_query)}"
+        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+            resp = client.get(wiki_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                title = data.get("title", "")
+                extract = data.get("extract", "")
+                page_url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+                if extract:
+                    return f"1. {title} (Wikipedia)\n   {page_url}\n   {extract}\n"
+    except Exception:
+        pass
+
+    return f"No results found for '{clean_query}'. (Cloud search provider rate-limited)."
 
 def fetch_page_content(url: str, max_chars: int = 6000) -> str:
     try:
@@ -195,7 +261,7 @@ async def handle_mcp_message(ws, raw_msg: str):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.1.0"}
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.2.0"}
             }
         }))
     elif method == "tools/list":
