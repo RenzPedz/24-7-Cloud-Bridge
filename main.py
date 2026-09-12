@@ -30,14 +30,16 @@ logging.basicConfig(
 # ==============================================================================
 HARDCODED_XIAOZHI_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
 HARDCODED_BRAVE_API_KEY = "BSAKb72H0GlIbFx7PtG0W1DAtNkTBib"
+HARDCODED_WEATHER_API_KEY = "f1c6328de66147e88aa125017261209"
 
 RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_XIAOZHI_TOKEN).strip().strip('"').strip("'")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", HARDCODED_BRAVE_API_KEY).strip()
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", HARDCODED_WEATHER_API_KEY).strip()
 PORT = int(os.environ.get("PORT", 8000))
 
 def get_sanitized_connection():
     if not RAW_TOKEN_INPUT:
-        logging.error("CRITICAL: No XIAOZHI_TOKEN provided!")
+        logging.error("CRITICAL: No XIAOZHI_TOKEN provided in code or environment!")
         return "wss://api.xiaozhi.me/mcp/", []
 
     raw = RAW_TOKEN_INPUT
@@ -111,162 +113,88 @@ def recall_facts(keyword: str = "") -> str:
         return f"Recall error: {e}"
 
 # ==============================================================================
-# HIGH-PRECISION WEATHER ENGINE (ECMWF / DWD HIGH-RES WITH GEOCODING)
+# API-KEY POWERED WEATHER ENGINE (WeatherAPI.com)
 # ==============================================================================
-WMO_WEATHER_CODES = {
-    0: "Clear sky ☀️",
-    1: "Mainly clear 🌤️",
-    2: "Partly cloudy ⛅",
-    3: "Overcast ☁️",
-    45: "Fog 🌫️",
-    48: "Depositing rime fog 🌫️",
-    51: "Light drizzle 🌦️",
-    53: "Moderate drizzle 🌦️",
-    55: "Dense drizzle 🌧️",
-    61: "Slight rain 🌧️",
-    63: "Moderate rain 🌧️",
-    65: "Heavy rain 🌧️⚡",
-    71: "Slight snowfall 🌨️",
-    73: "Moderate snowfall 🌨️",
-    75: "Heavy snowfall ❄️",
-    80: "Slight rain showers 🌦️",
-    81: "Moderate rain showers 🌧️",
-    82: "Violent rain showers ⛈️",
-    95: "Thunderstorm ⛈️",
-    96: "Thunderstorm with slight hail ⛈️🌨️",
-    99: "Thunderstorm with heavy hail ⛈️❄️"
-}
+def get_live_weather(location: str = "Manila") -> str:
+    """Fetches high-accuracy real-time weather and forecast using WeatherAPI."""
+    loc = location.strip() or "Manila"
 
-def resolve_location_coordinates(location_query: str):
-    try:
-        url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location_query)}&count=1&language=en&format=json"
-        with httpx.Client(timeout=6.0) as client:
-            resp = client.get(url)
-            data = resp.json()
-            if "results" in data and len(data["results"]) > 0:
-                target = data["results"][0]
-                resolved_name = f"{target.get('name')}, {target.get('admin1', '')} ({target.get('country_code', '')})".replace(",  ", ", ")
-                return float(target["latitude"]), float(target["longitude"]), resolved_name
-    except Exception as e:
-        logging.warning(f"Geocoding error: {e}")
-    return None, None, location_query
+    if not WEATHER_API_KEY:
+        # Graceful fallback if WEATHER_API_KEY environment variable is omitted
+        try:
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(loc)}&count=1"
+            with httpx.Client(timeout=6.0) as client:
+                res = client.get(geo_url).json()
+                if "results" in res and res["results"]:
+                    lat, lon = res["results"][0]["latitude"], res["results"][0]["longitude"]
+                    fc_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m&timezone=auto"
+                    curr = client.get(fc_url).json().get("current", {})
+                    return f"Weather for {loc}: {curr.get('temperature_2m')}°C (Feels like {curr.get('apparent_temperature')}°C), Humidity: {curr.get('relative_humidity_2m')}%, Wind: {curr.get('wind_speed_10m')} km/h"
+        except Exception:
+            pass
+        return "Error: WEATHER_API_KEY environment variable is not configured on Render."
 
-def get_detailed_weather(location: str = "", latitude: float = None, longitude: float = None) -> str:
-    loc_name = location.strip()
-    lat, lon = latitude, longitude
-
-    if loc_name and (lat is None or lon is None):
-        lat, lon, loc_name = resolve_location_coordinates(loc_name)
-
-    if lat is None or lon is None:
-        lat, lon, loc_name = 14.5995, 120.9842, "Default Location (Manila)"
+    url = f"https://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={urllib.parse.quote(loc)}&days=1&aqi=no"
 
     try:
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "current": [
-                "temperature_2m", "relative_humidity_2m", "apparent_temperature",
-                "is_day", "precipitation", "weather_code", "pressure_msl",
-                "surface_pressure", "wind_speed_10m", "wind_gusts_10m", "uv_index"
-            ],
-            "daily": [
-                "weather_code", "temperature_2m_max", "temperature_2m_min",
-                "precipitation_sum", "precipitation_probability_max", "uv_index_max"
-            ],
-            "timezone": "auto",
-            "models": "best_match"
-        }
-
-        url = "https://api.open-meteo.com/v1/forecast"
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        current = data.get("current", {})
-        daily = data.get("daily", {})
-
-        weather_code = current.get("weather_code", 0)
-        condition_desc = WMO_WEATHER_CODES.get(weather_code, "Partly Cloudy")
-
-        temp = current.get("temperature_2m", "N/A")
-        feels_like = current.get("apparent_temperature", "N/A")
-        humidity = current.get("relative_humidity_2m", "N/A")
-        wind_spd = current.get("wind_speed_10m", "N/A")
-        wind_gust = current.get("wind_gusts_10m", "N/A")
-        uv = current.get("uv_index", "N/A")
-        pressure = current.get("surface_pressure", "N/A")
-
-        temp_max = daily.get("temperature_2m_max", ["N/A"])[0]
-        temp_min = daily.get("temperature_2m_min", ["N/A"])[0]
-        rain_sum = daily.get("precipitation_sum", [0])[0]
-        rain_prob = daily.get("precipitation_probability_max", [0])[0]
-
-        return (
-            f"Weather Report for {loc_name} (Accurate Multi-Model Forecast):\n"
-            f"- Condition: {condition_desc}\n"
-            f"- Temperature: {temp}°C (Feels like: {feels_like}°C)\n"
-            f"- Today's Range: Low {temp_min}°C / High {temp_max}°C\n"
-            f"- Humidity: {humidity}%\n"
-            f"- Wind Speed: {wind_spd} km/h (Gusts up to {wind_gust} km/h)\n"
-            f"- UV Index: {uv} (Peak today: {daily.get('uv_index_max', ['N/A'])[0]})\n"
-            f"- Atmospheric Pressure: {pressure} hPa\n"
-            f"- Rainfall Outlook: {rain_sum} mm accumulation ({rain_prob}% probability)"
-        )
-    except Exception as e:
-        return f"High-precision weather query failed: {str(e)}"
-
-def get_rainfall_forecast(location: str = "", latitude: float = None, longitude: float = None) -> str:
-    loc_name = location.strip()
-    lat, lon = latitude, longitude
-
-    if loc_name and (lat is None or lon is None):
-        lat, lon, loc_name = resolve_location_coordinates(loc_name)
-
-    if lat is None or lon is None:
-        lat, lon, loc_name = 14.5995, 120.9842, "Default Location"
-
-    try:
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&hourly=precipitation_probability,rain,showers"
-            f"&daily=precipitation_sum,precipitation_probability_max"
-            f"&timezone=auto&models=best_match"
-        )
         with httpx.Client(timeout=8.0) as client:
             resp = client.get(url)
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                return f"Weather provider error: {resp.text}"
             data = resp.json()
 
-        daily = data.get("daily", {})
-        hourly = data.get("hourly", {})
-
-        today_sum = daily.get("precipitation_sum", [0])[0]
-        today_prob = daily.get("precipitation_probability_max", [0])[0]
-
-        curr_h = datetime.datetime.now().hour
-        upcoming_probs = hourly.get("precipitation_probability", [])[curr_h:curr_h+6]
-        upcoming_rain = hourly.get("rain", [])[curr_h:curr_h+6]
-
-        max_upcoming = max(upcoming_probs) if upcoming_probs else 0
-        total_upcoming = round(sum(upcoming_rain), 2) if upcoming_rain else 0.0
-
-        alert = "Rainfall expected - keep an umbrella handy!" if max_upcoming >= 45 or today_sum > 2.0 else "Minimal precipitation risk."
+        curr = data.get("current", {})
+        forecast_day = data.get("forecast", {}).get("forecastday", [{}])[0].get("day", {})
+        loc_info = data.get("location", {})
 
         return (
-            f"Rainfall & Precipitation Radar for {loc_name}:\n"
-            f"- Total Expected Rain Today: {today_sum} mm\n"
-            f"- Daily Max Probability: {today_prob}%\n"
-            f"- Next 6-Hour Outlook: Peak {max_upcoming}% chance (~{total_upcoming} mm accumulation)\n"
-            f"- Advisory: {alert}"
+            f"Weather for {loc_info.get('name')}, {loc_info.get('region')} ({loc_info.get('country')}):\n"
+            f"- Condition: {curr.get('condition', {}).get('text')}\n"
+            f"- Temperature: {curr.get('temp_c')}°C (Feels like: {curr.get('feelslike_c')}°C)\n"
+            f"- Today's Range: High {forecast_day.get('maxtemp_c')}°C / Low {forecast_day.get('mintemp_c')}°C\n"
+            f"- Humidity: {curr.get('humidity')}%\n"
+            f"- Wind Speed: {curr.get('wind_kph')} km/h (Gusts: {curr.get('gust_kph')} km/h)\n"
+            f"- UV Index: {curr.get('uv')}\n"
+            f"- Rain Probability: {forecast_day.get('daily_chance_of_rain')}% ({forecast_day.get('totalprecip_mm')} mm expected)"
+        )
+    except Exception as e:
+        return f"Failed to retrieve weather: {str(e)}"
+
+def get_rainfall_forecast(location: str = "Manila") -> str:
+    """Provides rainfall probabilities, accumulation sums, and rain advisories."""
+    loc = location.strip() or "Manila"
+
+    if not WEATHER_API_KEY:
+        return get_live_weather(loc)
+
+    url = f"https://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={urllib.parse.quote(loc)}&days=1&aqi=no"
+
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return f"Rainfall query error: {resp.text}"
+            data = resp.json()
+
+        forecast_day = data.get("forecast", {}).get("forecastday", [{}])[0].get("day", {})
+        loc_info = data.get("location", {})
+        chance = forecast_day.get("daily_chance_of_rain", 0)
+        total_mm = forecast_day.get("totalprecip_mm", 0.0)
+
+        advisory = "Rain expected - consider carrying an umbrella!" if int(chance) >= 45 or float(total_mm) > 2.0 else "Minimal rain risk."
+
+        return (
+            f"Rainfall Forecast for {loc_info.get('name')}, {loc_info.get('country')}:\n"
+            f"- Probability of Rain: {chance}%\n"
+            f"- Expected Precipitation: {total_mm} mm\n"
+            f"- Condition: {forecast_day.get('condition', {}).get('text')}\n"
+            f"- Advisory: {advisory}"
         )
     except Exception as e:
         return f"Failed to retrieve rainfall forecast: {str(e)}"
 
 # ==============================================================================
-# CLOUD SEARCH & SYSTEM DIAGNOSTICS
+# CLOUD SEARCH (BRAVE SEARCH PRIMARY + MULTI-TIER FALLBACKS)
 # ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
     clean_query = query.strip()
@@ -351,9 +279,11 @@ def search_web(query: str, max_results: int = 5) -> str:
 
     return f"No results found for '{clean_query}'. (Search provider rate-limited)."
 
+# ==============================================================================
+# SYSTEM DIAGNOSTICS & HELPERS
+# ==============================================================================
 def test_network_speed() -> str:
     try:
-        logging.info("Running speedtest benchmark on cloud server...")
         st = speedtest.Speedtest()
         st.get_best_server()
         down_mbps = round(st.download() / 1e6, 2)
@@ -389,7 +319,7 @@ def scan_wifi_signal() -> str:
             f"Cloud Network Status (Render Datacenter):\n"
             f"- Connection Type: High-Speed Fiber Uplink (Virtual Ethernet)\n"
             f"- Active Interfaces: {', '.join(active_interfaces) if active_interfaces else 'eth0'}\n"
-            f"- Note: Cloud servers run on direct datacenter fiber uplinks, not wireless 802.11 Wi-Fi."
+            f"- Note: Cloud servers use datacenter fiber uplinks, not wireless 802.11 Wi-Fi."
         )
     except Exception as e:
         return f"Failed to inspect network interface: {str(e)}"
@@ -412,31 +342,35 @@ def execute_python_calc(code: str) -> str:
         return f"Calculation error: {e}"
 
 # ==============================================================================
-# TOOL REGISTRY (CLOUD OPTIMIZED)
+# TOOL REGISTRY (CLOUD-NATIVE)
 # ==============================================================================
 TOOLS = [
     {
         "name": "get_live_weather",
-        "description": "Fetches meteorological weather data (temperature, real feel, weather condition, UV index, humidity, wind gusts, and air pressure) using high-resolution models. Accepts city names or coordinates.",
+        "description": "Fetches accurate weather data (temperature, feels-like, condition, humidity, UV index, wind speed) for any city or location name.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "location": {"type": "string", "description": "City, town, province, or country name (e.g., 'Manila', 'Baguio', 'Tokyo')."},
-                "latitude": {"type": "number", "description": "Optional latitude coordinate."},
-                "longitude": {"type": "number", "description": "Optional longitude coordinate."}
-            }
+                "location": {
+                    "type": "string",
+                    "description": "City, province, town, or location name (e.g., 'Manila', 'Baguio', 'Cauayan')."
+                }
+            },
+            "required": ["location"]
         }
     },
     {
         "name": "get_rainfall_forecast",
-        "description": "Calculates precise precipitation accumulation in mm, rain probabilities, and next 6-hour shower risks. Accepts city names or coordinates.",
+        "description": "Checks precipitation probabilities, rain mm accumulation, and shower advisories for any given city or area.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "location": {"type": "string", "description": "City or location name."},
-                "latitude": {"type": "number", "description": "Optional latitude coordinate."},
-                "longitude": {"type": "number", "description": "Optional longitude coordinate."}
-            }
+                "location": {
+                    "type": "string",
+                    "description": "City or location name to check for rain."
+                }
+            },
+            "required": ["location"]
         }
     },
     {
@@ -526,7 +460,7 @@ async def handle_mcp_message(ws, raw_msg: str):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.5.0"}
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.6.0"}
             }
         }))
     elif method == "tools/list":
@@ -542,16 +476,12 @@ async def handle_mcp_message(ws, raw_msg: str):
 
         try:
             if name in ("get_live_weather", "get_weather", "weather"):
-                loc = args.get("location", "")
-                lat = float(args["latitude"]) if "latitude" in args and args["latitude"] is not None else None
-                lon = float(args["longitude"]) if "longitude" in args and args["longitude"] is not None else None
-                result_text = await asyncio.to_thread(get_detailed_weather, loc, lat, lon)
+                loc = args.get("location") or args.get("query") or "Manila"
+                result_text = await asyncio.to_thread(get_live_weather, loc)
 
             elif name in ("get_rainfall_forecast", "rainfall_forecast", "check_rain"):
-                loc = args.get("location", "")
-                lat = float(args["latitude"]) if "latitude" in args and args["latitude"] is not None else None
-                lon = float(args["longitude"]) if "longitude" in args and args["longitude"] is not None else None
-                result_text = await asyncio.to_thread(get_rainfall_forecast, loc, lat, lon)
+                loc = args.get("location") or args.get("query") or "Manila"
+                result_text = await asyncio.to_thread(get_rainfall_forecast, loc)
 
             elif name == "web_search":
                 result_text = await asyncio.to_thread(search_web, args.get("query", ""))
@@ -626,7 +556,7 @@ async def run_mcp_bridge():
 # AIOHTTP KEEP-ALIVE SERVER (PORT 8000)
 # ==============================================================================
 async def health_check(request):
-    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 with High-Precision Weather!")
+    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 on Render!")
 
 async def start_background_tasks(app):
     app['mcp_task'] = asyncio.create_task(run_mcp_bridge())
