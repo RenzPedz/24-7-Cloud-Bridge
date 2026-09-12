@@ -28,8 +28,8 @@ logging.basicConfig(
 # ==============================================================================
 # CONFIGURATION & AUTHENTICATION
 # ==============================================================================
-HARDCODED_XIAOZHI_TOKEN = ""
-HARDCODED_BRAVE_API_KEY = ""
+HARDCODED_XIAOZHI_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
+HARDCODED_BRAVE_API_KEY = "BSAKb72H0GlIbFx7PtG0W1DAtNkTBib"
 
 RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_XIAOZHI_TOKEN).strip().strip('"').strip("'")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", HARDCODED_BRAVE_API_KEY).strip()
