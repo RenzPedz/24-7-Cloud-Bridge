@@ -28,17 +28,16 @@ logging.basicConfig(
 # ==============================================================================
 # CONFIGURATION & AUTHENTICATION
 # ==============================================================================
-HARDCODED_XIAOZHI_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEwNjc3MDAsImFnZW50SWQiOjIzMjg2OTQsImVuZHBvaW50SWQiOiJhZ2VudF8yMzI4Njk0IiwicHVycG9zZSI6Im1jcC1lbmRwb2ludCIsImlhdCI6MTc4OTAxNzMwOCwiZXhwIjoxODIwNTc0OTA4fQ.mPvYHCmo0nsbaftvmZ_0WbF6CO9AraC5lGo5ZBIBjJQMwIc2GN_QpmSfuyS1kUl2TBxD0ZRUQB9Z2OmJtX104Q"
-HARDCODED_BRAVE_API_KEY = "BSAKb72H0GlIbFx7PtG0W1DAtNkTBib"
+HARDCODED_XIAOZHI_TOKEN = ""
+HARDCODED_BRAVE_API_KEY = ""
 
 RAW_TOKEN_INPUT = os.environ.get("XIAOZHI_TOKEN", HARDCODED_XIAOZHI_TOKEN).strip().strip('"').strip("'")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", HARDCODED_BRAVE_API_KEY).strip()
 PORT = int(os.environ.get("PORT", 8000))
 
 def get_sanitized_connection():
-    """Extracts raw token cleanly and formats the canonical WSS endpoint."""
     if not RAW_TOKEN_INPUT:
-        logging.error("CRITICAL: No XIAOZHI_TOKEN provided in code or environment!")
+        logging.error("CRITICAL: No XIAOZHI_TOKEN provided!")
         return "wss://api.xiaozhi.me/mcp/", []
 
     raw = RAW_TOKEN_INPUT
@@ -78,15 +77,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS player_state (
-            id INTEGER PRIMARY KEY,
-            current_track TEXT,
-            stream_url TEXT,
-            status TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -121,123 +111,168 @@ def recall_facts(keyword: str = "") -> str:
         return f"Recall error: {e}"
 
 # ==============================================================================
-# CLOUD MUSIC STREAM ENGINE
+# HIGH-PRECISION WEATHER ENGINE (ECMWF / DWD HIGH-RES WITH GEOCODING)
 # ==============================================================================
-CURATED_AUDIO_FEEDS = {
-    "lofi": ("Lofi Chillout Lounge", "https://stream.zeno.fm/f3wvbbqmdg8uv"),
-    "chill": ("Lofi Sleep & Study Beats", "https://stream.zeno.fm/f3wvbbqmdg8uv"),
-    "jazz": ("Classic Jazz Heritage Stream", "https://icecast.walmradio.com:8443/jazz"),
-    "classical": ("Musopen Symphony Classical", "https://live.musopen.org:8085/streamvbr0"),
-    "relax": ("Ambient Relaxation Waves", "https://stream.zeno.fm/f3wvbbqmdg8uv"),
-    "piano": ("Peaceful Solo Piano Radio", "https://live.musopen.org:8085/streamvbr0"),
-    "pop": ("Global Top Hits Stream", "https://icecast.walmradio.com:8443/jazz"),
-    "news": ("Global News Radio 24/7", "https://icecast.walmradio.com:8443/jazz")
+WMO_WEATHER_CODES = {
+    0: "Clear sky ☀️",
+    1: "Mainly clear 🌤️",
+    2: "Partly cloudy ⛅",
+    3: "Overcast ☁️",
+    45: "Fog 🌫️",
+    48: "Depositing rime fog 🌫️",
+    51: "Light drizzle 🌦️",
+    53: "Moderate drizzle 🌦️",
+    55: "Dense drizzle 🌧️",
+    61: "Slight rain 🌧️",
+    63: "Moderate rain 🌧️",
+    65: "Heavy rain 🌧️⚡",
+    71: "Slight snowfall 🌨️",
+    73: "Moderate snowfall 🌨️",
+    75: "Heavy snowfall ❄️",
+    80: "Slight rain showers 🌦️",
+    81: "Moderate rain showers 🌧️",
+    82: "Violent rain showers ⛈️",
+    95: "Thunderstorm ⛈️",
+    96: "Thunderstorm with slight hail ⛈️🌨️",
+    99: "Thunderstorm with heavy hail ⛈️❄️"
 }
 
-def resolve_music_stream(query: str) -> dict:
-    clean_q = query.lower().strip()
-    if not clean_q:
-        clean_q = "lofi"
-
-    # 1. Match curated high-stability streams
-    for key, (title, stream_url) in CURATED_AUDIO_FEEDS.items():
-        if key in clean_q:
-            return {
-                "title": title,
-                "url": stream_url,
-                "genre": key.capitalize(),
-                "source": "Curated Stream"
-            }
-
-    # 2. Query Radio-Browser directory for live radio stations and genres
+def resolve_location_coordinates(location_query: str):
     try:
-        search_endpoint = f"https://de1.api.radio-browser.info/json/stations/byname/{urllib.parse.quote(clean_q)}"
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location_query)}&count=1&language=en&format=json"
         with httpx.Client(timeout=6.0) as client:
-            resp = client.get(search_endpoint, headers={"User-Agent": "XiaoZhiMCPMusic/1.0"})
-            if resp.status_code == 200:
-                stations = resp.json()
-                if stations and len(stations) > 0:
-                    for station in stations[:3]:
-                        stream = station.get("url_resolved") or station.get("url")
-                        if stream and (stream.startswith("http://") or stream.startswith("https://")):
-                            return {
-                                "title": station.get("name", query),
-                                "url": stream,
-                                "genre": station.get("tags", "Radio"),
-                                "source": "Radio-Browser Live"
-                            }
+            resp = client.get(url)
+            data = resp.json()
+            if "results" in data and len(data["results"]) > 0:
+                target = data["results"][0]
+                resolved_name = f"{target.get('name')}, {target.get('admin1', '')} ({target.get('country_code', '')})".replace(",  ", ", ")
+                return float(target["latitude"]), float(target["longitude"]), resolved_name
     except Exception as e:
-        logging.warning(f"Radio-browser search failed: {e}")
+        logging.warning(f"Geocoding error: {e}")
+    return None, None, location_query
 
-    # 3. Fallback default stream
-    return {
-        "title": f"Lofi Relaxing Vibes (Fallback for '{query}')",
-        "url": "https://stream.zeno.fm/f3wvbbqmdg8uv",
-        "genre": "Lofi / Relax",
-        "source": "Default Cloud Radio"
-    }
+def get_detailed_weather(location: str = "", latitude: float = None, longitude: float = None) -> str:
+    loc_name = location.strip()
+    lat, lon = latitude, longitude
 
-def play_music_track(query: str) -> str:
-    stream_data = resolve_music_stream(query)
-    title = stream_data["title"]
-    url = stream_data["url"]
-    genre = stream_data["genre"]
+    if loc_name and (lat is None or lon is None):
+        lat, lon, loc_name = resolve_location_coordinates(loc_name)
+
+    if lat is None or lon is None:
+        lat, lon, loc_name = 14.5995, 120.9842, "Default Location (Manila)"
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO player_state (id, current_track, stream_url, status) VALUES (1, ?, ?, 'playing')", (title, url))
-        conn.commit()
-        conn.close()
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current": [
+                "temperature_2m", "relative_humidity_2m", "apparent_temperature",
+                "is_day", "precipitation", "weather_code", "pressure_msl",
+                "surface_pressure", "wind_speed_10m", "wind_gusts_10m", "uv_index"
+            ],
+            "daily": [
+                "weather_code", "temperature_2m_max", "temperature_2m_min",
+                "precipitation_sum", "precipitation_probability_max", "uv_index_max"
+            ],
+            "timezone": "auto",
+            "models": "best_match"
+        }
+
+        url = "https://api.open-meteo.com/v1/forecast"
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        current = data.get("current", {})
+        daily = data.get("daily", {})
+
+        weather_code = current.get("weather_code", 0)
+        condition_desc = WMO_WEATHER_CODES.get(weather_code, "Partly Cloudy")
+
+        temp = current.get("temperature_2m", "N/A")
+        feels_like = current.get("apparent_temperature", "N/A")
+        humidity = current.get("relative_humidity_2m", "N/A")
+        wind_spd = current.get("wind_speed_10m", "N/A")
+        wind_gust = current.get("wind_gusts_10m", "N/A")
+        uv = current.get("uv_index", "N/A")
+        pressure = current.get("surface_pressure", "N/A")
+
+        temp_max = daily.get("temperature_2m_max", ["N/A"])[0]
+        temp_min = daily.get("temperature_2m_min", ["N/A"])[0]
+        rain_sum = daily.get("precipitation_sum", [0])[0]
+        rain_prob = daily.get("precipitation_probability_max", [0])[0]
+
+        return (
+            f"Weather Report for {loc_name} (Accurate Multi-Model Forecast):\n"
+            f"- Condition: {condition_desc}\n"
+            f"- Temperature: {temp}°C (Feels like: {feels_like}°C)\n"
+            f"- Today's Range: Low {temp_min}°C / High {temp_max}°C\n"
+            f"- Humidity: {humidity}%\n"
+            f"- Wind Speed: {wind_spd} km/h (Gusts up to {wind_gust} km/h)\n"
+            f"- UV Index: {uv} (Peak today: {daily.get('uv_index_max', ['N/A'])[0]})\n"
+            f"- Atmospheric Pressure: {pressure} hPa\n"
+            f"- Rainfall Outlook: {rain_sum} mm accumulation ({rain_prob}% probability)"
+        )
     except Exception as e:
-        logging.warning(f"Failed to record player state: {e}")
+        return f"High-precision weather query failed: {str(e)}"
 
-    return (
-        f"Music stream started: '{title}' [{genre}].\n"
-        f"Stream URL: {url}\n"
-        f"[AUDIO_URL: {url}]"
-    )
+def get_rainfall_forecast(location: str = "", latitude: float = None, longitude: float = None) -> str:
+    loc_name = location.strip()
+    lat, lon = latitude, longitude
 
-def control_music_playback(action: str) -> str:
-    act = action.lower().strip()
+    if loc_name and (lat is None or lon is None):
+        lat, lon, loc_name = resolve_location_coordinates(loc_name)
+
+    if lat is None or lon is None:
+        lat, lon, loc_name = 14.5995, 120.9842, "Default Location"
+
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT current_track, stream_url, status FROM player_state WHERE id = 1")
-        row = c.fetchone()
-        track = row[0] if row else "Unknown Stream"
-        url = row[1] if row else ""
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&hourly=precipitation_probability,rain,showers"
+            f"&daily=precipitation_sum,precipitation_probability_max"
+            f"&timezone=auto&models=best_match"
+        )
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
 
-        if act in ("pause", "stop"):
-            c.execute("UPDATE player_state SET status = 'stopped' WHERE id = 1")
-            conn.commit()
-            conn.close()
-            return f"Audio playback stopped. [AUDIO_STOP: {track}]"
+        daily = data.get("daily", {})
+        hourly = data.get("hourly", {})
 
-        elif act in ("resume", "play"):
-            c.execute("UPDATE player_state SET status = 'playing' WHERE id = 1")
-            conn.commit()
-            conn.close()
-            return f"Resumed playback of '{track}'. [AUDIO_URL: {url}]"
+        today_sum = daily.get("precipitation_sum", [0])[0]
+        today_prob = daily.get("precipitation_probability_max", [0])[0]
 
-        elif act in ("next", "skip"):
-            conn.close()
-            return play_music_track("lofi")
+        curr_h = datetime.datetime.now().hour
+        upcoming_probs = hourly.get("precipitation_probability", [])[curr_h:curr_h+6]
+        upcoming_rain = hourly.get("rain", [])[curr_h:curr_h+6]
 
-        conn.close()
-        return f"Unknown music playback action: {action}"
+        max_upcoming = max(upcoming_probs) if upcoming_probs else 0
+        total_upcoming = round(sum(upcoming_rain), 2) if upcoming_rain else 0.0
+
+        alert = "Rainfall expected - keep an umbrella handy!" if max_upcoming >= 45 or today_sum > 2.0 else "Minimal precipitation risk."
+
+        return (
+            f"Rainfall & Precipitation Radar for {loc_name}:\n"
+            f"- Total Expected Rain Today: {today_sum} mm\n"
+            f"- Daily Max Probability: {today_prob}%\n"
+            f"- Next 6-Hour Outlook: Peak {max_upcoming}% chance (~{total_upcoming} mm accumulation)\n"
+            f"- Advisory: {alert}"
+        )
     except Exception as e:
-        return f"Playback control error: {str(e)}"
+        return f"Failed to retrieve rainfall forecast: {str(e)}"
 
 # ==============================================================================
-# CLOUD SEARCH (BRAVE PRIMARY + MULTI-TIER FALLBACKS)
+# CLOUD SEARCH & SYSTEM DIAGNOSTICS
 # ==============================================================================
 def search_web(query: str, max_results: int = 5) -> str:
     clean_query = query.strip()
     if not clean_query:
         return "Please provide a valid search query."
 
-    # Strategy 1: Brave Search API
     if BRAVE_API_KEY:
         try:
             url = "https://api.search.brave.com/res/v1/web/search"
@@ -259,7 +294,6 @@ def search_web(query: str, max_results: int = 5) -> str:
         except Exception as e:
             logging.warning(f"Brave Search failed: {e}. Falling back...")
 
-    # Strategy 2: DDGS with 'lite' backend
     try:
         with DDGS(timeout=7) as ddgs:
             results = list(ddgs.text(clean_query, max_results=max_results, backend="lite"))
@@ -268,7 +302,6 @@ def search_web(query: str, max_results: int = 5) -> str:
     except Exception as e:
         logging.warning(f"DDGS failed on cloud: {e}. Trying direct HTML...")
 
-    # Strategy 3: Direct DuckDuckGo HTML parsing
     try:
         url = "https://html.duckduckgo.com/html/"
         data = {"q": clean_query}
@@ -302,7 +335,6 @@ def search_web(query: str, max_results: int = 5) -> str:
     except Exception as e:
         logging.warning(f"Direct HTML scrape failed: {e}")
 
-    # Strategy 4: Wikipedia REST API fallback
     try:
         wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(clean_query)}"
         with httpx.Client(timeout=5.0, follow_redirects=True) as client:
@@ -319,9 +351,6 @@ def search_web(query: str, max_results: int = 5) -> str:
 
     return f"No results found for '{clean_query}'. (Search provider rate-limited)."
 
-# ==============================================================================
-# SYSTEM & WEATHER UTILITIES
-# ==============================================================================
 def test_network_speed() -> str:
     try:
         logging.info("Running speedtest benchmark on cloud server...")
@@ -375,27 +404,6 @@ def fetch_page_content(url: str, max_chars: int = 6000) -> str:
     except Exception as e:
         return f"Fetch error: {e}"
 
-def get_live_weather(latitude: float, longitude: float) -> str:
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,wind_speed_10m&timezone=auto"
-        with httpx.Client(timeout=10.0) as client:
-            data = client.get(url).json().get("current", {})
-        return f"Current Weather: {data.get('temperature_2m')}°C (Feels like {data.get('apparent_temperature')}°C), Humidity: {data.get('relative_humidity_2m')}%, Wind: {data.get('wind_speed_10m')} km/h"
-    except Exception as e:
-        return f"Weather error: {e}"
-
-def get_rainfall_forecast(latitude: float, longitude: float) -> str:
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&hourly=precipitation_probability,rain&daily=precipitation_sum,precipitation_probability_max&timezone=auto"
-        with httpx.Client(timeout=10.0) as client:
-            data = client.get(url).json()
-        daily = data.get("daily", {})
-        today_sum = daily.get("precipitation_sum", [0])[0]
-        today_prob = daily.get("precipitation_probability_max", [0])[0]
-        return f"Rainfall Forecast: Expected precipitation today: {today_sum} mm. Peak probability: {today_prob}%."
-    except Exception as e:
-        return f"Rainfall error: {e}"
-
 def execute_python_calc(code: str) -> str:
     try:
         allowed = {"math": math, "abs": abs, "round": round, "min": min, "max": max, "sum": sum, "pow": pow}
@@ -404,20 +412,98 @@ def execute_python_calc(code: str) -> str:
         return f"Calculation error: {e}"
 
 # ==============================================================================
-# TOOL REGISTRY (CLOUD + MUSIC TOOLS)
+# TOOL REGISTRY (CLOUD OPTIMIZED)
 # ==============================================================================
 TOOLS = [
-    {"name": "play_music", "description": "Searches for an audio track, genre, lofi beats, or radio station and streams it directly to the speaker.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "Genre, song name, radio station, or artist (e.g. 'lofi', 'jazz', 'classical', 'pop')."}}, "required": ["query"]}},
-    {"name": "control_music", "description": "Controls cloud music playback state (pause, resume, stop, next).", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["pause", "resume", "stop", "next"]}}, "required": ["action"]}},
-    {"name": "web_search", "description": "Searches the live web via Brave Search with automated multi-tier fallbacks.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
-    {"name": "test_network_speed", "description": "Measures download bandwidth, upload throughput, and ping latency in real-time.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "scan_wifi_signal", "description": "Inspects active network connection, Wi-Fi SSID signal strength, and adapter status.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "fetch_page_content", "description": "Extracts clean readable text from a given webpage URL.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-    {"name": "get_live_weather", "description": "Gets current temperature, feels-like temperature, and wind speed using coordinates.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
-    {"name": "get_rainfall_forecast", "description": "Fetches rainfall accumulation in mm and rain probability percentage.", "inputSchema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}, "required": ["latitude", "longitude"]}},
-    {"name": "remember_fact", "description": "Stores permanent facts and notes in the cloud SQLite database.", "inputSchema": {"type": "object", "properties": {"fact": {"type": "string"}, "category": {"type": "string"}}, "required": ["fact"]}},
-    {"name": "recall_facts", "description": "Retrieves stored facts and user notes from the cloud database.", "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}}},
-    {"name": "execute_python_calc", "description": "Performs exact Python math and arithmetic evaluation.", "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}
+    {
+        "name": "get_live_weather",
+        "description": "Fetches meteorological weather data (temperature, real feel, weather condition, UV index, humidity, wind gusts, and air pressure) using high-resolution models. Accepts city names or coordinates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City, town, province, or country name (e.g., 'Manila', 'Baguio', 'Tokyo')."},
+                "latitude": {"type": "number", "description": "Optional latitude coordinate."},
+                "longitude": {"type": "number", "description": "Optional longitude coordinate."}
+            }
+        }
+    },
+    {
+        "name": "get_rainfall_forecast",
+        "description": "Calculates precise precipitation accumulation in mm, rain probabilities, and next 6-hour shower risks. Accepts city names or coordinates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City or location name."},
+                "latitude": {"type": "number", "description": "Optional latitude coordinate."},
+                "longitude": {"type": "number", "description": "Optional longitude coordinate."}
+            }
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Searches the live web via Brave Search with automated multi-tier fallbacks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "test_network_speed",
+        "description": "Measures download bandwidth, upload throughput, and ping latency in real-time.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "scan_wifi_signal",
+        "description": "Inspects active network connection, Wi-Fi SSID signal strength, and adapter status.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "fetch_page_content",
+        "description": "Extracts clean readable text from a given webpage URL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "remember_fact",
+        "description": "Stores permanent facts and notes in the cloud SQLite database.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fact": {"type": "string"},
+                "category": {"type": "string"}
+            },
+            "required": ["fact"]
+        }
+    },
+    {
+        "name": "recall_facts",
+        "description": "Retrieves stored facts and user notes from the cloud database.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string"}
+            }
+        }
+    },
+    {
+        "name": "execute_python_calc",
+        "description": "Performs exact Python math and arithmetic evaluation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"}
+            },
+            "required": ["code"]
+        }
+    }
 ]
 
 # ==============================================================================
@@ -440,7 +526,7 @@ async def handle_mcp_message(ws, raw_msg: str):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.4.0"}
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.5.0"}
             }
         }))
     elif method == "tools/list":
@@ -455,32 +541,42 @@ async def handle_mcp_message(ws, raw_msg: str):
         result_text, is_err = "", False
 
         try:
-            if name == "play_music":
-                query_val = args.get("query", "lofi")
-                result_text = await asyncio.to_thread(play_music_track, query_val)
-            elif name == "control_music":
-                action_val = args.get("action", "stop")
-                result_text = await asyncio.to_thread(control_music_playback, action_val)
+            if name in ("get_live_weather", "get_weather", "weather"):
+                loc = args.get("location", "")
+                lat = float(args["latitude"]) if "latitude" in args and args["latitude"] is not None else None
+                lon = float(args["longitude"]) if "longitude" in args and args["longitude"] is not None else None
+                result_text = await asyncio.to_thread(get_detailed_weather, loc, lat, lon)
+
+            elif name in ("get_rainfall_forecast", "rainfall_forecast", "check_rain"):
+                loc = args.get("location", "")
+                lat = float(args["latitude"]) if "latitude" in args and args["latitude"] is not None else None
+                lon = float(args["longitude"]) if "longitude" in args and args["longitude"] is not None else None
+                result_text = await asyncio.to_thread(get_rainfall_forecast, loc, lat, lon)
+
             elif name == "web_search":
                 result_text = await asyncio.to_thread(search_web, args.get("query", ""))
+
             elif name in ("test_network_speed", "speed_test", "wifi_speed"):
                 result_text = await asyncio.to_thread(test_network_speed)
+
             elif name in ("scan_wifi_signal", "check_wifi", "wifi_status"):
                 result_text = await asyncio.to_thread(scan_wifi_signal)
+
             elif name == "fetch_page_content":
                 result_text = await asyncio.to_thread(fetch_page_content, args.get("url", ""))
-            elif name == "get_live_weather":
-                result_text = await asyncio.to_thread(get_live_weather, float(args["latitude"]), float(args["longitude"]))
-            elif name == "get_rainfall_forecast":
-                result_text = await asyncio.to_thread(get_rainfall_forecast, float(args["latitude"]), float(args["longitude"]))
+
             elif name == "remember_fact":
                 result_text = remember_fact(args.get("fact"), args.get("category", "general"))
+
             elif name == "recall_facts":
                 result_text = recall_facts(args.get("keyword", ""))
+
             elif name == "execute_python_calc":
                 result_text = execute_python_calc(args.get("code", ""))
+
             else:
                 result_text, is_err = f"Tool '{name}' not found on cloud server.", True
+
         except Exception as e:
             result_text, is_err = str(e), True
 
@@ -530,7 +626,7 @@ async def run_mcp_bridge():
 # AIOHTTP KEEP-ALIVE SERVER (PORT 8000)
 # ==============================================================================
 async def health_check(request):
-    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 with Music Player on Render!")
+    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 with High-Precision Weather!")
 
 async def start_background_tasks(app):
     app['mcp_task'] = asyncio.create_task(run_mcp_bridge())
