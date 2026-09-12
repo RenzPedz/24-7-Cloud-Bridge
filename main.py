@@ -113,14 +113,53 @@ def recall_facts(keyword: str = "") -> str:
         return f"Recall error: {e}"
 
 # ==============================================================================
+# HANDS-FREE GAMING ASSISTANT CO-PILOT (ELDEN RING & PS5 CONTROLLER COMPANION)
+# ==============================================================================
+def game_assistant_lookup(game_title: str, query: str) -> str:
+    """
+    Retrieves tactical gaming intel, boss weaknesses, item locations,
+    and quest paths formatted specifically for spoken voice advice.
+    """
+    clean_game = game_title.strip() or "Elden Ring"
+    search_prompt = f"{clean_game} {query} weakness strategy guide location site:fextralife.com OR site:ign.com"
+
+    if BRAVE_API_KEY:
+        try:
+            url = "https://api.search.brave.com/res/v1/web/search"
+            headers = {
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": BRAVE_API_KEY
+            }
+            params = {"q": search_prompt, "count": 3}
+            with httpx.Client(timeout=6.0) as client:
+                resp = client.get(url, headers=headers, params=params)
+                if resp.status_code == 200:
+                    results = resp.json().get("web", {}).get("results", [])
+                    if results:
+                        snippets = [f"- {r.get('title')}: {r.get('description')}" for r in results[:2]]
+                        return f"Gaming Intel for {clean_game} ({query}):\n" + "\n".join(snippets)
+        except Exception as e:
+            logging.warning(f"Brave gaming search fallback: {e}")
+
+    try:
+        with DDGS(timeout=6) as ddgs:
+            results = list(ddgs.text(f"{clean_game} {query} weakness guide", max_results=2, backend="lite"))
+            if results:
+                snippets = [f"- {item.get('title')}: {item.get('body')}" for item in results]
+                return f"Gaming Intel for {clean_game} ({query}):\n" + "\n".join(snippets)
+    except Exception as e:
+        logging.warning(f"DDGS gaming lookup failed: {e}")
+
+    return f"Could not find detailed tactical intel for {query} in {clean_game}."
+
+# ==============================================================================
 # API-KEY POWERED WEATHER ENGINE (WeatherAPI.com)
 # ==============================================================================
 def get_live_weather(location: str = "Manila") -> str:
-    """Fetches high-accuracy real-time weather and forecast using WeatherAPI."""
     loc = location.strip() or "Manila"
 
     if not WEATHER_API_KEY:
-        # Graceful fallback if WEATHER_API_KEY environment variable is omitted
         try:
             geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(loc)}&count=1"
             with httpx.Client(timeout=6.0) as client:
@@ -161,9 +200,7 @@ def get_live_weather(location: str = "Manila") -> str:
         return f"Failed to retrieve weather: {str(e)}"
 
 def get_rainfall_forecast(location: str = "Manila") -> str:
-    """Provides rainfall probabilities, accumulation sums, and rain advisories."""
     loc = location.strip() or "Manila"
-
     if not WEATHER_API_KEY:
         return get_live_weather(loc)
 
@@ -342,9 +379,27 @@ def execute_python_calc(code: str) -> str:
         return f"Calculation error: {e}"
 
 # ==============================================================================
-# TOOL REGISTRY (CLOUD-NATIVE)
+# TOOL REGISTRY (CLOUD NATIVE + GAMING ASSISTANT)
 # ==============================================================================
 TOOLS = [
+    {
+        "name": "game_assistant_lookup",
+        "description": "Tactical gaming co-pilot. Look up boss weaknesses, status vulnerabilities, quest locations, item drop coordinates, and build advice for Elden Ring or any console/PC game.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "game_title": {
+                    "type": "string",
+                    "description": "Name of the game (defaults to 'Elden Ring')."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Boss, enemy, quest, item, or tactical question (e.g., 'Malenia weakness', 'Moonveil katana location')."
+                }
+            },
+            "required": ["query"]
+        }
+    },
     {
         "name": "get_live_weather",
         "description": "Fetches accurate weather data (temperature, feels-like, condition, humidity, UV index, wind speed) for any city or location name.",
@@ -460,7 +515,7 @@ async def handle_mcp_message(ws, raw_msg: str):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.6.0"}
+                "serverInfo": {"name": "xiaozhi-render-cloud", "version": "1.7.0"}
             }
         }))
     elif method == "tools/list":
@@ -475,7 +530,12 @@ async def handle_mcp_message(ws, raw_msg: str):
         result_text, is_err = "", False
 
         try:
-            if name in ("get_live_weather", "get_weather", "weather"):
+            if name in ("game_assistant_lookup", "gaming_guide", "elden_ring_helper"):
+                game = args.get("game_title", "Elden Ring")
+                q = args.get("query", "")
+                result_text = await asyncio.to_thread(game_assistant_lookup, game, q)
+
+            elif name in ("get_live_weather", "get_weather", "weather"):
                 loc = args.get("location") or args.get("query") or "Manila"
                 result_text = await asyncio.to_thread(get_live_weather, loc)
 
@@ -556,7 +616,7 @@ async def run_mcp_bridge():
 # AIOHTTP KEEP-ALIVE SERVER (PORT 8000)
 # ==============================================================================
 async def health_check(request):
-    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 on Render!")
+    return web.Response(text="XiaoZhi Cloud MCP Bridge is Running 24/7 with Gaming Co-Pilot on Render!")
 
 async def start_background_tasks(app):
     app['mcp_task'] = asyncio.create_task(run_mcp_bridge())
